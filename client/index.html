@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Private Library Platform — Local Player</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #111827; color: #f9fafb; }
+    main { box-sizing: border-box; max-width: 960px; min-height: 100vh; margin: 0 auto; padding: 3rem 1.5rem; }
+    h1 { margin: 0 0 .5rem; font-size: 1.75rem; }
+    p { color: #cbd5e1; }
+    video { width: 100%; margin-top: 1.5rem; background: #000; border-radius: .5rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Local media player</h1>
+    <p>This player is streaming the media file served by this node.</p>
+    <video controls preload="metadata" src="/media">
+      Your browser does not support HTML video playback.
+    </video>
+  </main>
+</body>
+</html>
