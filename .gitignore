@@ -1,3 +1,40 @@
+# Rust build output
 /target/
+
+# Runtime logs and local configuration
 *.log
+.env
+.env.*
+!.env.example
+
+# Local libraries, uploads, and test media
+/media/
+/test_media/
+/uploads/
+/library/
+/data/
+
+# Media payloads should live outside the source repository
+*.mp4
+*.m4v
+*.mkv
+*.mov
+*.avi
+*.webm
+*.mp3
+*.m4a
+*.aac
+*.wav
+*.flac
+*.ogg
+
+# Test and coverage artifacts
+/coverage/
+*.profraw
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
