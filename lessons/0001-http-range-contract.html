@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How our HTTP byte-range contract follows RFC 9110</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">Lesson 0001 · Milestone 0.1.2</p>
+  <h1>How our byte-range contract follows RFC 9110</h1>
+  <p class="lede">The browser does not need an entire movie before it can play or seek. It asks the server for selected byte intervals, and the server must interpret those intervals consistently.</p>
+
+  <div class="callout"><strong>First correction:</strong> <code>bytes=-6</code> means “the final six bytes.” It does not mean offset zero through <code>length - 6</code>.</div>
+
+  <h2>Start with a concrete file</h2>
+  <p>Our tests use the 11-byte value <code>video-bytes</code>:</p>
+  <pre><code>byte:   v i d e o - b y t e s
+index:  0 1 2 3 4 5 6 7 8 9 10</code></pre>
+
+  <table>
+    <thead><tr><th>Header</th><th>Selected indexes</th><th>Body</th></tr></thead>
+    <tbody>
+      <tr><td><code>bytes=2-5</code></td><td>2, 3, 4, 5</td><td><code>deo-</code></td></tr>
+      <tr><td><code>bytes=6-</code></td><td>6 through 10</td><td><code>bytes</code></td></tr>
+      <tr><td><code>bytes=-5</code></td><td>the final five: 6 through 10</td><td><code>bytes</code></td></tr>
+      <tr><td><code>bytes=-6</code></td><td>the final six: 5 through 10</td><td><code>-bytes</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>RFC 9110 defines offsets from zero and makes both endpoints inclusive. That is why the length calculation in Rust is:</p>
+  <pre><code>self.end - self.start + 1</code></pre>
+
+  <h2>The request decision</h2>
+  <p>The server now makes these distinctions:</p>
+  <div class="flow">
+    <div class="step">1. Is the method GET? If not, ignore Range.</div>
+    <div class="arrow">↓</div>
+    <div class="step">2. Split the value into range unit and range specification.</div>
+    <div class="arrow">↓</div>
+    <div class="step">3. Is the unit “bytes”, compared case-insensitively? If unknown, ignore it.</div>
+    <div class="arrow">↓</div>
+    <div class="step">4. Is the single byte range valid and satisfiable? Select it or reject it.</div>
+    <div class="arrow">↓</div>
+    <div class="step">5. Return 200, 206, or 416 and the corresponding headers.</div>
+  </div>
+
+  <h3>Why a three-way Rust result?</h3>
+  <pre><code>enum ParsedRange {
+    Selected(ByteRange),
+    UnsupportedUnit,
+    Invalid,
+}</code></pre>
+  <p>Previously, parsing returned only success or failure. That incorrectly grouped an unknown unit such as <code>items</code> with a malformed byte range. RFC 9110 requires an origin server to ignore a range unit it does not understand, so those outcomes must stay separate.</p>
+  <p><code>Invalid</code> is a broad implementation label: it currently covers malformed syntax, reversed endpoints, ranges beyond EOF, zero-length suffixes, and multiple ranges. Every one follows our current rejection path to <code>416</code>.</p>
+
+  <h2>Each RFC-driven change</h2>
+
+  <h3>1. Range units are case-insensitive</h3>
+  <p><code>Bytes=6-10</code> and <code>bytes=6-10</code> mean the same thing. The old parser used a case-sensitive prefix check. It now splits at <code>=</code> and calls <code>eq_ignore_ascii_case("bytes")</code>.</p>
+
+  <h3>2. Unknown units are ignored</h3>
+  <p>For <code>Range: items=0-1</code>, our server does not understand <code>items</code>. Ignoring the header means processing the request as though Range were absent: return <code>200 OK</code> and the whole file. It does not mean ignoring the entire request.</p>
+
+  <h3>3. Range applies only to GET</h3>
+  <p>RFC 9110 defines Range handling for <code>GET</code>, not <code>HEAD</code>. Our old implementation applied a range to HEAD and returned <code>206</code>. It now discards the range before selection, returns the normal full-resource metadata with <code>200</code>, and still sends no body.</p>
+
+  <h3>4. Satisfiable ranges produce 206</h3>
+  <p>A selected interval returns <code>206 Partial Content</code>. <code>Content-Range: bytes 6-10/11</code> says which bytes are enclosed and that the complete representation is 11 bytes. <code>Content-Length: 5</code> describes only the transmitted body.</p>
+
+  <h3>5. Unsatisfiable ranges produce 416</h3>
+  <p>For an 11-byte file, <code>bytes=11-12</code> starts beyond the final valid index, 10. Our response includes <code>Content-Range: bytes */11</code>: no range was selected, and the current complete length is 11.</p>
+
+  <h3>6. Oversized ranges are clamped</h3>
+  <p><code>bytes=6-999</code> is not rejected merely because 999 is beyond EOF. RFC 9110 interprets it as the remainder of the representation, so we select 6 through 10. Likewise, if a suffix is longer than the file, the whole representation is selected.</p>
+
+  <h3>7. Multiple ranges remain deferred</h3>
+  <p>The standard supports multiple ranges, but a correct response requires a <code>multipart/byteranges</code> body with boundaries and per-part headers. Milestone 0.1 deliberately rejects them rather than implementing a partial or misleading version.</p>
+
+  <h2>What the tests prove</h2>
+  <p>The integration tests launch the compiled daemon, connect over TCP, send real HTTP text, and compare exact response bytes. The tables cover accepted, rejected, empty-file, unknown-unit, and HEAD behavior. They verify the public interface rather than calling the private parser directly.</p>
+
+  <h2>Retrieval practice</h2>
+  <details>
+    <summary>For an 11-byte file, what does bytes=-6 select?</summary>
+    <p>The final six bytes, indexes 5 through 10. For <code>video-bytes</code>, the body is <code>-bytes</code>.</p>
+  </details>
+  <details>
+    <summary>Why does an unknown unit return 200 rather than 416?</summary>
+    <p>RFC 9110 requires an origin server to ignore a range unit it does not understand. Ignoring Range leaves an ordinary full GET, which returns 200.</p>
+  </details>
+  <details>
+    <summary>Why does HEAD plus Range return 200 in our server?</summary>
+    <p>Range semantics are defined only for GET. HEAD ignores Range and reports the headers for the full GET response while omitting the body.</p>
+  </details>
+
+  <p><a href="../reference/http-byte-ranges.html">Open the compact byte-range reference →</a></p>
+  <p class="caption">Primary source: <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-14">RFC 9110 §14, Range Requests</a>. Ask your agent about any step that still feels unclear.</p>
+</main>
+</body>
+</html>

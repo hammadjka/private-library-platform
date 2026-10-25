@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP Byte-Range Reference</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">Private Library Platform · Reference</p>
+  <h1>HTTP byte ranges</h1>
+  <p class="lede">A compact guide to the range behavior implemented in milestone 0.1.2.</p>
+
+  <table>
+    <thead><tr><th>Request</th><th>Meaning for an 11-byte file</th><th>Our response</th></tr></thead>
+    <tbody>
+      <tr><td><code>bytes=2-5</code></td><td>Offsets 2 through 5, inclusive</td><td><code>206</code>, four bytes</td></tr>
+      <tr><td><code>bytes=6-</code></td><td>Offset 6 through the final byte</td><td><code>206</code>, five bytes</td></tr>
+      <tr><td><code>bytes=-5</code></td><td>The final five bytes</td><td><code>206</code>, five bytes</td></tr>
+      <tr><td><code>bytes=6-999</code></td><td>End is clamped to offset 10</td><td><code>206</code>, five bytes</td></tr>
+      <tr><td><code>bytes=11-12</code></td><td>Start is at or beyond EOF</td><td><code>416</code></td></tr>
+      <tr><td><code>items=0-1</code></td><td>Unknown range unit</td><td>Ignore header; full <code>200</code></td></tr>
+      <tr><td><code>HEAD</code> plus any Range</td><td>Range is not defined for HEAD</td><td>Ignore header; metadata-only <code>200</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout"><strong>Length formula:</strong> <code>end - start + 1</code>. The extra one exists because both endpoints count.</div>
+
+  <h2>Response headers</h2>
+  <pre><code>HTTP/1.1 206 Partial Content
+Content-Length: 5
+Content-Range: bytes 6-10/11
+Accept-Ranges: bytes</code></pre>
+  <p><code>6-10</code> is the selected inclusive interval; <code>11</code> is the complete representation length.</p>
+
+  <pre><code>HTTP/1.1 416 Range Not Satisfiable
+Content-Length: 0
+Content-Range: bytes */11
+Accept-Ranges: bytes</code></pre>
+  <p>The asterisk means no interval was selected; <code>11</code> still tells the client the current complete length.</p>
+
+  <h2>RFC vocabulary</h2>
+  <table>
+    <thead><tr><th>Word</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><strong>MUST</strong></td><td>Required for conformance.</td></tr>
+      <tr><td><strong>SHOULD</strong></td><td>Expected unless a specific, understood reason justifies another choice.</td></tr>
+      <tr><td><strong>MAY</strong></td><td>Optional behavior.</td></tr>
+    </tbody>
+  </table>
+
+  <p class="caption">Primary source: <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-14">RFC 9110 §14</a></p>
+</main>
+</body>
+</html>
