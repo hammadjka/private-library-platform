@@ -1,10 +1,11 @@
 use std::{
     fs,
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, Command},
-    thread,
+    process::{Child, ChildStderr, Command, Stdio},
+    sync::mpsc,
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,12 +13,16 @@ struct RunningServer {
     child: Child,
     address: SocketAddr,
     media_path: PathBuf,
+    stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for RunningServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(stderr_thread) = self.stderr_thread.take() {
+            let _ = stderr_thread.join();
+        }
         let _ = fs::remove_file(&self.media_path);
     }
 }
@@ -30,32 +35,64 @@ fn start_server(bytes: &[u8]) -> RunningServer {
     let media_path = std::env::temp_dir().join(format!("plpd-media-{unique}.mp4"));
     fs::write(&media_path, bytes).expect("write test media");
 
-    let probe = TcpListener::bind("127.0.0.1:0").expect("reserve local port");
-    let address = probe.local_addr().expect("read local address");
-    drop(probe);
-
-    let child = Command::new(env!("CARGO_BIN_EXE_plpd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_plpd"))
         .args([
             "--media",
             media_path.to_str().expect("media path is UTF-8"),
             "--bind",
-            &address.to_string(),
+            "127.0.0.1:0",
         ])
+        .stderr(Stdio::piped())
         .spawn()
         .expect("start daemon");
 
-    for _ in 0..40 {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(25)).is_ok() {
-            return RunningServer {
-                child,
-                address,
-                media_path,
-            };
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    let stderr = child.stderr.take().expect("capture daemon stderr");
+    let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+    let stderr_thread = thread::spawn(move || drain_server_stderr(stderr, startup_sender));
 
-    panic!("daemon did not begin listening at {address}");
+    let address = match startup_receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(address) => address,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            let _ = fs::remove_file(&media_path);
+            panic!("daemon did not report its listening address: {error}");
+        }
+    };
+
+    RunningServer {
+        child,
+        address,
+        media_path,
+        stderr_thread: Some(stderr_thread),
+    }
+}
+
+fn drain_server_stderr(stderr: ChildStderr, startup_sender: mpsc::SyncSender<SocketAddr>) {
+    let mut startup_sender = Some(startup_sender);
+
+    for line in BufReader::new(stderr).lines() {
+        match line {
+            Ok(line) => {
+                if let (Some(address), Some(sender)) =
+                    (startup_address(&line), startup_sender.take())
+                {
+                    let _ = sender.send(address);
+                }
+                eprintln!("{line}");
+            }
+            Err(error) => {
+                eprintln!("failed to read daemon stderr: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn startup_address(line: &str) -> Option<SocketAddr> {
+    let (_, address) = line.rsplit_once(" at http://")?;
+    address.strip_suffix("/media")?.parse().ok()
 }
 
 fn request(address: SocketAddr, request: &str) -> Vec<u8> {

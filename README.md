@@ -27,6 +27,7 @@ cargo test
 ```
 
 The platform design is in [docs/private-library-platform-spec.md](docs/private-library-platform-spec.md).
+The ordered product milestones and active investment sequence are in [docs/roadmap.md](docs/roadmap.md).
 
 ## Status
 
