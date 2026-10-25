@@ -207,10 +207,12 @@ fn serve_media(
 ) -> io::Result<()> {
     let mut media = File::open(media_path)?;
     let total_length = media.metadata()?.len();
+    let requested_range = if head_only { None } else { requested_range };
     let byte_range = match requested_range {
         Some(value) => match ByteRange::parse(value, total_length) {
-            Ok(range) => Some(range),
-            Err(()) => return write_range_not_satisfiable(stream, total_length),
+            ParsedRange::Selected(range) => Some(range),
+            ParsedRange::UnsupportedUnit => None,
+            ParsedRange::Invalid => return write_range_not_satisfiable(stream, total_length),
         },
         None => None,
     };
@@ -253,40 +255,60 @@ struct ByteRange {
     end: u64,
 }
 
+enum ParsedRange {
+    Selected(ByteRange),
+    UnsupportedUnit,
+    Invalid,
+}
+
 impl ByteRange {
-    fn parse(value: &str, total_length: u64) -> Result<Self, ()> {
-        let value = value.strip_prefix("bytes=").ok_or(())?;
-        if value.contains(',') {
-            return Err(());
+    fn parse(value: &str, total_length: u64) -> ParsedRange {
+        let Some((unit, value)) = value.split_once('=') else {
+            return ParsedRange::Invalid;
+        };
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return ParsedRange::UnsupportedUnit;
         }
-        let (start, end) = value.split_once('-').ok_or(())?;
+        if value.contains(',') {
+            return ParsedRange::Invalid;
+        }
+        let Some((start, end)) = value.split_once('-') else {
+            return ParsedRange::Invalid;
+        };
 
         if start.is_empty() {
-            let suffix_length = end.parse::<u64>().map_err(|_| ())?;
+            let Ok(suffix_length) = end.parse::<u64>() else {
+                return ParsedRange::Invalid;
+            };
             if suffix_length == 0 || total_length == 0 {
-                return Err(());
+                return ParsedRange::Invalid;
             }
             let start = total_length.saturating_sub(suffix_length);
-            return Ok(Self {
+            return ParsedRange::Selected(Self {
                 start,
                 end: total_length - 1,
             });
         }
 
-        let start = start.parse::<u64>().map_err(|_| ())?;
+        let Ok(start) = start.parse::<u64>() else {
+            return ParsedRange::Invalid;
+        };
         if start >= total_length {
-            return Err(());
+            return ParsedRange::Invalid;
         }
         let end = if end.is_empty() {
             total_length - 1
         } else {
-            end.parse::<u64>().map_err(|_| ())?.min(total_length - 1)
+            let Ok(end) = end.parse::<u64>() else {
+                return ParsedRange::Invalid;
+            };
+            end.min(total_length - 1)
         };
         if end < start {
-            return Err(());
+            return ParsedRange::Invalid;
         }
 
-        Ok(Self { start, end })
+        ParsedRange::Selected(Self { start, end })
     }
 
     fn length(self) -> u64 {
