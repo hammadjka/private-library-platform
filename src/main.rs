@@ -1,3 +1,6 @@
+mod server;
+
+use server::PLAYER_PAGE;
 use std::{
     env,
     fs::File,
@@ -8,7 +11,6 @@ use std::{
 };
 
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
-const PLAYER_PAGE: &str = include_str!("../client/index.html");
 
 #[derive(Debug)]
 struct Configuration {

@@ -5,6 +5,13 @@ edition = "2021"
 description = "Private Library Platform daemon"
 license = "AGPL-3.0-or-later"
 
+[dependencies]
+axum = { version = "=0.7.9", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "=1.38.1", features = ["macros", "rt"] }
+tower = { version = "=0.5.1", features = ["util"] }
+
 [[bin]]
 name = "plpd"
 path = "src/main.rs"
