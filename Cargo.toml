@@ -6,10 +6,11 @@ description = "Private Library Platform daemon"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-axum = { version = "=0.7.9", default-features = false }
+axum = { version = "=0.7.9", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "=1.38.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+tokio-util = { version = "=0.7.11", features = ["io"] }
 
 [dev-dependencies]
-tokio = { version = "=1.38.1", features = ["macros", "rt"] }
 tower = { version = "=0.5.1", features = ["util"] }
 
 [[bin]]

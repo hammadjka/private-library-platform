@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
@@ -14,6 +15,20 @@ struct RunningServer {
     address: SocketAddr,
     media_path: PathBuf,
     stderr_thread: Option<JoinHandle<()>>,
+}
+
+struct HttpResponse {
+    status_line: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
 }
 
 impl Drop for RunningServer {
@@ -95,18 +110,37 @@ fn startup_address(line: &str) -> Option<SocketAddr> {
     address.strip_suffix("/media")?.parse().ok()
 }
 
-fn request(address: SocketAddr, request: &str) -> Vec<u8> {
+fn request(address: SocketAddr, request: &str) -> HttpResponse {
     let mut stream = TcpStream::connect(address).expect("connect to daemon");
     stream
         .write_all(request.as_bytes())
         .expect("send HTTP request");
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .expect("finish request");
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
-    response
+    parse_response(response)
+}
+
+fn parse_response(response: Vec<u8>) -> HttpResponse {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response contains a header terminator");
+    let head = std::str::from_utf8(&response[..header_end]).expect("response headers are UTF-8");
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("response has a status line").to_owned();
+    let headers = lines
+        .map(|line| {
+            let (name, value) = line.split_once(':').expect("response header contains ':'");
+            (name.to_ascii_lowercase(), value.trim().to_owned())
+        })
+        .collect();
+
+    HttpResponse {
+        status_line,
+        headers,
+        body: response[header_end + 4..].to_vec(),
+    }
 }
 
 #[test]
@@ -117,13 +151,16 @@ fn serves_a_browser_player_at_the_root_url() {
         server.address,
         "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    let response = String::from_utf8(response).expect("player page is UTF-8");
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    let body = String::from_utf8(response.body).expect("player page is UTF-8");
 
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
-    assert!(response.contains("<video"));
-    assert!(response.contains("src=\"/media\""));
-    assert!(response.contains("controls"));
+    assert!(body.contains("<video"));
+    assert!(body.contains("src=\"/media\""));
+    assert!(body.contains("controls"));
 }
 
 #[test]
@@ -135,10 +172,11 @@ fn streams_the_entire_media_file() {
         "GET /media HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    assert_eq!(
-        response,
-        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\nvideo-bytes"
-    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(response.header("content-length"), Some("11"));
+    assert_eq!(response.header("content-type"), Some("video/mp4"));
+    assert_eq!(response.header("accept-ranges"), Some("bytes"));
+    assert_eq!(response.body, b"video-bytes");
 }
 
 #[test]
@@ -161,12 +199,23 @@ fn streams_supported_single_byte_ranges() {
                 "GET /media HTTP/1.1\r\nHost: localhost\r\nRange: {range}\r\nConnection: close\r\n\r\n"
             ),
         );
-        let expected = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: {content_range}\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+        assert_eq!(
+            response.status_line, "HTTP/1.1 206 Partial Content",
+            "range {range}"
         );
-
-        assert_eq!(response, expected.as_bytes(), "range {range}");
+        assert_eq!(
+            response.header("content-length"),
+            Some(body.len().to_string().as_str()),
+            "range {range}"
+        );
+        assert_eq!(
+            response.header("content-range"),
+            Some(content_range),
+            "range {range}"
+        );
+        assert_eq!(response.header("content-type"), Some("video/mp4"));
+        assert_eq!(response.header("accept-ranges"), Some("bytes"));
+        assert_eq!(response.body, body.as_bytes(), "range {range}");
     }
 }
 
@@ -193,10 +242,13 @@ fn rejects_invalid_unsatisfiable_or_multiple_byte_ranges() {
         );
 
         assert_eq!(
-            response,
-            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */11\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+            response.status_line, "HTTP/1.1 416 Range Not Satisfiable",
             "range {range}"
         );
+        assert_eq!(response.header("content-length"), Some("0"));
+        assert_eq!(response.header("content-range"), Some("bytes */11"));
+        assert_eq!(response.header("accept-ranges"), Some("bytes"));
+        assert!(response.body.is_empty());
     }
 }
 
@@ -209,10 +261,11 @@ fn ignores_an_unsupported_range_unit() {
         "GET /media HTTP/1.1\r\nHost: localhost\r\nRange: items=0-1\r\nConnection: close\r\n\r\n",
     );
 
-    assert_eq!(
-        response,
-        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\nvideo-bytes"
-    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(response.header("content-length"), Some("11"));
+    assert_eq!(response.header("content-type"), Some("video/mp4"));
+    assert_eq!(response.header("accept-ranges"), Some("bytes"));
+    assert_eq!(response.body, b"video-bytes");
 }
 
 #[test]
@@ -223,19 +276,24 @@ fn handles_an_empty_media_file() {
         server.address,
         "GET /media HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
-    assert_eq!(
-        full_response,
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
-    );
+    assert_eq!(full_response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(full_response.header("content-length"), Some("0"));
+    assert_eq!(full_response.header("content-type"), Some("video/mp4"));
+    assert_eq!(full_response.header("accept-ranges"), Some("bytes"));
+    assert!(full_response.body.is_empty());
 
     let range_response = request(
         server.address,
         "GET /media HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(
-        range_response,
-        b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+        range_response.status_line,
+        "HTTP/1.1 416 Range Not Satisfiable"
     );
+    assert_eq!(range_response.header("content-length"), Some("0"));
+    assert_eq!(range_response.header("content-range"), Some("bytes */0"));
+    assert_eq!(range_response.header("accept-ranges"), Some("bytes"));
+    assert!(range_response.body.is_empty());
 }
 
 #[test]
@@ -247,10 +305,11 @@ fn head_describes_media_without_sending_its_bytes() {
         "HEAD /media HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    assert_eq!(
-        response,
-        b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
-    );
+    assert_eq!(response.status_line, "HTTP/1.1 200 OK");
+    assert_eq!(response.header("content-length"), Some("11"));
+    assert_eq!(response.header("content-type"), Some("video/mp4"));
+    assert_eq!(response.header("accept-ranges"), Some("bytes"));
+    assert!(response.body.is_empty());
 }
 
 #[test]
@@ -265,10 +324,11 @@ fn head_ignores_ranges_and_sends_no_media_bytes() {
                 "HEAD /media HTTP/1.1\r\nHost: localhost\r\nRange: {range}\r\nConnection: close\r\n\r\n"
             ),
         );
-        assert_eq!(
-            response,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-            "range {range}"
-        );
+        assert_eq!(response.status_line, "HTTP/1.1 200 OK", "range {range}");
+        assert_eq!(response.header("content-length"), Some("11"));
+        assert_eq!(response.header("content-type"), Some("video/mp4"));
+        assert_eq!(response.header("accept-ranges"), Some("bytes"));
+        assert!(response.header("content-range").is_none());
+        assert!(response.body.is_empty(), "range {range}");
     }
 }
