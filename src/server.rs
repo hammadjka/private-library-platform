@@ -412,4 +412,43 @@ mod tests {
             .expect("read response body");
         assert!(body.is_empty());
     }
+
+    #[tokio::test]
+    async fn unknown_route_returns_not_found_without_details() {
+        let response = router(PathBuf::new())
+            .oneshot(
+                Request::builder()
+                    .uri("/unknown")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_route_with_unsupported_method_returns_method_not_allowed() {
+        let response = router(PathBuf::new())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/media")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        assert!(body.is_empty());
+    }
 }

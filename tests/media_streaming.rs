@@ -332,3 +332,33 @@ fn head_ignores_ranges_and_sends_no_media_bytes() {
         assert!(response.body.is_empty(), "range {range}");
     }
 }
+
+#[test]
+fn returns_an_empty_internal_error_if_media_disappears_after_startup() {
+    let server = start_server(b"video-bytes");
+    fs::remove_file(&server.media_path).expect("remove media after startup");
+
+    let response = request(
+        server.address,
+        "GET /media HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(response.status_line, "HTTP/1.1 500 Internal Server Error");
+    assert_eq!(response.header("content-length"), Some("0"));
+    assert!(response.body.is_empty());
+}
+
+#[test]
+fn malformed_http_is_rejected_without_exposing_internal_paths() {
+    let server = start_server(b"video-bytes");
+
+    let response = request(
+        server.address,
+        "GET / HTTP/1.1\r\nThis is not a header\r\n\r\n",
+    );
+
+    assert_eq!(response.status_line, "HTTP/1.1 400 Bad Request");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(!body.contains(server.media_path.to_string_lossy().as_ref()));
+    assert!(!body.contains("plpd-media-"));
+}
