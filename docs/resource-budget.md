@@ -73,9 +73,10 @@ measured compatibility problem gives us a reason to change them.
 ## Implementation consequences for 0.1.9
 
 - Configure Hyper's HTTP/1 connection builder explicitly for header count,
-  read-buffer ceiling, and header-read timeout. The pinned Hyper 1.3.1 exposes
-  `max_headers`, `max_buf_size`, and `header_read_timeout`; the timeout requires
-  a timer.
+  request-head size, and header-read timeout. Hyper 1.12 exposes `max_headers`,
+  `max_header_size`, and `header_read_timeout`; the timeout requires a timer.
+  Hyper was upgraded from 1.3.1 because `max_buf_size` controls buffer growth,
+  not an exact request-head ceiling.
 - An explicit accept loop may replace the `axum::serve` convenience function so
   the connection permit covers the full connection and Hyper parsing limits can
   be configured. The Axum router remains the request handler.
@@ -87,7 +88,7 @@ measured compatibility problem gives us a reason to change them.
 
 ## Primary references
 
-- [Hyper 1.3.1 HTTP/1 connection builder](https://docs.rs/hyper/1.3.1/hyper/server/conn/http1/struct.Builder.html)
+- [Hyper 1.12.0 HTTP/1 connection builder](https://docs.rs/hyper/1.12.0/hyper/server/conn/http1/struct.Builder.html)
 - [Tokio semaphore](https://docs.rs/tokio/1.38.1/tokio/sync/struct.Semaphore.html)
 - [Tower concurrency limit](https://docs.rs/tower/0.5.1/tower/limit/concurrency/struct.ConcurrencyLimit.html)
 - [Axum 0.7.9 server and graceful shutdown](https://docs.rs/axum/0.7.9/axum/serve/struct.Serve.html)

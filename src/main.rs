@@ -1,5 +1,6 @@
 mod range;
 mod server;
+mod transport;
 
 use std::{env, io, net::SocketAddr, path::PathBuf, process};
 use tokio::net::TcpListener;
@@ -74,5 +75,5 @@ async fn run(configuration: Configuration) -> io::Result<()> {
         configuration.media_path.display()
     );
 
-    axum::serve(listener, server::router(configuration.media_path)).await
+    transport::serve(listener, server::router(configuration.media_path)).await
 }
