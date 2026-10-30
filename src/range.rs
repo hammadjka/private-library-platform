@@ -1,16 +1,38 @@
+//! Framework-independent parsing for a single HTTP byte range.
+//!
+//! Keeping this module free of Axum, Hyper, filesystem, and socket types makes
+//! the range rules reusable by a future storage layer and easy to test in
+//! isolation.
+
+/// A selected inclusive byte interval within a representation.
 #[derive(Clone, Copy)]
 pub(crate) struct ByteRange {
+    /// Zero-based offset of the first selected byte.
     start: u64,
+    /// Zero-based offset of the last selected byte, inclusive.
     end: u64,
 }
 
+/// The application-level outcomes of parsing a `Range` header.
 pub(crate) enum ParsedRange {
+    /// A valid, satisfiable range that can be served.
     Selected(ByteRange),
+    /// A syntactically recognizable range whose unit is not `bytes`.
+    ///
+    /// The HTTP adapter ignores unsupported units and serves the complete
+    /// representation.
     UnsupportedUnit,
+    /// A malformed, multiple, empty, or unsatisfiable byte range.
     Invalid,
 }
 
 impl ByteRange {
+    /// Parses one range value against a representation of `total_length` bytes.
+    ///
+    /// Supported forms are `bytes=START-END`, `bytes=START-`, and
+    /// `bytes=-SUFFIX_LENGTH`. Explicit end offsets beyond the representation
+    /// are clamped to its final byte. Multiple ranges are intentionally
+    /// unsupported.
     pub(crate) fn parse(value: &str, total_length: u64) -> ParsedRange {
         let Some((unit, value)) = value.split_once('=') else {
             return ParsedRange::Invalid;
@@ -60,14 +82,19 @@ impl ByteRange {
         ParsedRange::Selected(Self { start, end })
     }
 
+    /// Returns the inclusive starting offset.
     pub(crate) fn start(self) -> u64 {
         self.start
     }
 
+    /// Returns the inclusive ending offset.
     pub(crate) fn end(self) -> u64 {
         self.end
     }
 
+    /// Returns the number of selected bytes.
+    ///
+    /// Both endpoints are inclusive, hence the additional byte in the formula.
     pub(crate) fn length(self) -> u64 {
         self.end - self.start + 1
     }

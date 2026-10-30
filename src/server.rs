@@ -1,43 +1,139 @@
+//! Axum application layer for the browser page and media endpoint.
+//!
+//! This module owns routes, application state, request policy, and HTTP
+//! responses. It does not accept sockets or parse HTTP/1; those transport
+//! responsibilities live in `transport`.
+
 use crate::range::{ByteRange, ParsedRange};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Request, State},
     http::{
-        header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+        header::{
+            ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+            RETRY_AFTER, TRANSFER_ENCODING,
+        },
         HeaderMap, StatusCode,
     },
+    middleware::{self, Next},
     response::{Html, Response},
     routing::get,
     Router,
 };
+use futures_core::Stream;
 use std::{path::PathBuf, sync::Arc};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
 };
 use tokio_util::io::ReaderStream;
 
+/// Browser player embedded into the executable at compile time.
 pub(crate) const PLAYER_PAGE: &str = include_str!("../client/index.html");
+/// Maximum number of response bodies that may actively hold media capacity.
+const MAX_MEDIA_STREAMS: usize = 16;
 
+/// Immutable application resources shared by every cloned Axum router.
 #[derive(Clone)]
 struct AppState {
+    /// Path selected by the operator when the daemon started.
     media_path: Arc<PathBuf>,
+    /// Permits for response bodies that can still produce media bytes.
+    media_streams: Arc<Semaphore>,
 }
 
+/// A response-body stream that owns a media-capacity permit.
+///
+/// Handlers return before Hyper finishes sending their response bodies. Keeping
+/// the permit inside this wrapper makes capacity follow the body lifetime rather
+/// than the shorter handler-future lifetime.
+struct PermitStream<S> {
+    /// Stream that produces the actual body chunks.
+    inner: S,
+    /// Released automatically when the body completes or is dropped.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S> Stream for PermitStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    /// Delegates body production to the inner stream while retaining ownership
+    /// of the permit.
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// Builds the complete HTTP application for one configured media file.
+///
+/// The returned router is cheap to clone: its media path and semaphore are
+/// reference-counted in `AppState`.
 pub(crate) fn router(media_path: PathBuf) -> Router {
     Router::new()
         .route("/", get(player_page))
         .route("/media", get(media).head(head_media))
         .with_state(AppState {
             media_path: Arc::new(media_path),
+            media_streams: Arc::new(Semaphore::new(MAX_MEDIA_STREAMS)),
         })
+        .layer(middleware::from_fn(reject_request_body))
 }
 
+/// Returns the embedded diagnostic player at `GET /`.
 async fn player_page() -> Html<&'static str> {
     Html(PLAYER_PAGE)
 }
 
+/// Rejects framed request bodies before routing to an application handler.
+///
+/// No current endpoint accepts uploads. A non-zero or invalid `Content-Length`,
+/// or any `Transfer-Encoding`, therefore receives `413 Payload Too Large`. The
+/// connection is closed because unread body bytes cannot safely be interpreted
+/// as the next HTTP/1 request.
+async fn reject_request_body(request: Request, next: Next) -> Response {
+    let content_length_is_nonzero_or_invalid = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(0)
+        })
+        .unwrap_or(false);
+    let uses_transfer_encoding = request.headers().contains_key(TRANSFER_ENCODING);
+
+    if content_length_is_nonzero_or_invalid || uses_transfer_encoding {
+        return Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(CONTENT_LENGTH, "0")
+            .header(CONNECTION, "close")
+            .body(Body::empty())
+            .expect("static response headers are valid");
+    }
+
+    next.run(request).await
+}
+
+/// Serves the complete media file or one satisfiable byte range.
+///
+/// File bytes are streamed with backpressure. The function constructs and
+/// returns a response; Hyper polls its body after this handler future finishes.
 async fn media(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, StatusCode> {
+    let permit = match Arc::clone(&state.media_streams).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return overloaded_response(),
+        Err(TryAcquireError::Closed) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let mut file = File::open(state.media_path.as_ref())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -50,6 +146,8 @@ async fn media(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
         Some(value) => match value.to_str() {
             Ok(value) => match ByteRange::parse(value, total_length) {
                 ParsedRange::Selected(range) => Some(range),
+                // An unknown unit is ignored, so the response describes the
+                // complete representation instead of interpreting it as bytes.
                 ParsedRange::UnsupportedUnit => None,
                 ParsedRange::Invalid => return range_not_satisfiable(total_length),
             },
@@ -78,7 +176,13 @@ async fn media(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
     };
 
     let content_type = content_type_for(state.media_path.as_ref());
-    let body = Body::from_stream(ReaderStream::new(file.take(content_length)));
+    // `take` exposes EOF after exactly `content_length` bytes. ReaderStream
+    // converts those bounded async reads into chunks Hyper can poll without
+    // loading the full file into memory.
+    let body = Body::from_stream(PermitStream {
+        inner: ReaderStream::new(file.take(content_length)),
+        _permit: permit,
+    });
     let mut response = Response::builder()
         .status(status)
         .header(CONTENT_LENGTH, content_length.to_string())
@@ -93,6 +197,18 @@ async fn media(State(state): State<AppState>, headers: HeaderMap) -> Result<Resp
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Builds the retryable response returned when all media permits are occupied.
+fn overloaded_response() -> Result<Response, StatusCode> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_LENGTH, "0")
+        .header(RETRY_AFTER, "1")
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Describes the complete media representation without constructing a body
+/// stream or consuming media-stream capacity.
 async fn head_media(State(state): State<AppState>) -> Result<Response, StatusCode> {
     let file = File::open(state.media_path.as_ref())
         .await
@@ -112,6 +228,7 @@ async fn head_media(State(state): State<AppState>) -> Result<Response, StatusCod
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Builds the empty `416 Range Not Satisfiable` response for this file length.
 fn range_not_satisfiable(total_length: u64) -> Result<Response, StatusCode> {
     Response::builder()
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -122,6 +239,8 @@ fn range_not_satisfiable(total_length: u64) -> Result<Response, StatusCode> {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Maps the small set of currently supported filename extensions to media
+/// types, falling back to opaque binary data.
 fn content_type_for(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("mp4") => "video/mp4",
@@ -140,7 +259,10 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{
-            header::{ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+            header::{
+                ACCEPT_RANGES, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+                RETRY_AFTER, TRANSFER_ENCODING,
+            },
             Method, Request, StatusCode,
         },
     };
@@ -450,5 +572,80 @@ mod tests {
             .await
             .expect("read response body");
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_stream_capacity_is_held_until_the_response_body_is_dropped() {
+        let media = TestMedia::new(b"video-bytes");
+        let app = router(media.path().to_owned());
+        let mut active_responses = Vec::new();
+
+        for _ in 0..16 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/media")
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("route request");
+            assert_eq!(response.status(), StatusCode::OK);
+            active_responses.push(response);
+        }
+
+        let overloaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/media")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers().get(RETRY_AFTER).unwrap(), "1");
+        let body = to_bytes(overloaded.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        assert!(body.is_empty());
+
+        active_responses.pop();
+        let recovered = app
+            .oneshot(
+                Request::builder()
+                    .uri("/media")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_bodies_are_rejected_and_the_connection_is_closed() {
+        for (header, value) in [(CONTENT_LENGTH, "1"), (TRANSFER_ENCODING, "chunked")] {
+            let response = router(PathBuf::new())
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header, value)
+                        .body(Body::from("x"))
+                        .expect("build request"),
+                )
+                .await
+                .expect("route request");
+
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "0");
+            assert_eq!(response.headers().get(CONNECTION).unwrap(), "close");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            assert!(body.is_empty());
+        }
     }
 }

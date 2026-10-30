@@ -7,10 +7,11 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 axum = { version = "=0.7.9", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "=1.38.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+futures-core = "=0.3.34"
+hyper = { version = "=1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "=0.1.5", features = ["service", "tokio"] }
+tokio = { version = "=1.38.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.11", features = ["io"] }
-
-[dev-dependencies]
 tower = { version = "=0.5.1", features = ["util"] }
 
 [[bin]]

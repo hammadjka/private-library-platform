@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
@@ -361,4 +362,41 @@ fn malformed_http_is_rejected_without_exposing_internal_paths() {
     let body = String::from_utf8_lossy(&response.body);
     assert!(!body.contains(server.media_path.to_string_lossy().as_ref()));
     assert!(!body.contains("plpd-media-"));
+}
+
+#[test]
+fn rejects_request_heads_larger_than_sixteen_kibibytes() {
+    let server = start_server(b"video-bytes");
+    let oversized_value = "x".repeat(16 * 1024);
+    let response = request(
+        server.address,
+        &format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX-Oversized: {oversized_value}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+
+    assert_eq!(
+        response.status_line,
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+    assert!(response.body.is_empty());
+}
+
+#[test]
+fn rejects_more_than_sixty_four_header_fields() {
+    let server = start_server(b"video-bytes");
+    let mut headers = String::new();
+    for index in 0..65 {
+        write!(headers, "X-Test-{index}: value\r\n").expect("write request header");
+    }
+    let response = request(
+        server.address,
+        &format!("GET / HTTP/1.1\r\n{headers}Connection: close\r\n\r\n"),
+    );
+
+    assert_eq!(
+        response.status_line,
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+    assert!(response.body.is_empty());
 }
