@@ -1,3 +1,9 @@
+//! Bounded TCP and HTTP/1 transport for the Axum application.
+//!
+//! Axum remains responsible for routing and handlers. This module invokes
+//! Hyper's connection builder directly because parser-level header limits and
+//! connection-lifetime permits must be applied below the router.
+
 use axum::{body::Body, Router};
 use hyper::{body::Incoming, server::conn::http1, Request};
 use hyper_util::{
@@ -20,16 +26,23 @@ use tokio::{
 };
 use tower::ServiceExt;
 
+/// Resource limits enforced before a request reaches an Axum handler.
 #[derive(Clone, Copy)]
 struct TransportLimits {
+    /// Maximum number of accepted connections with live Hyper tasks.
     max_connections: usize,
+    /// Maximum bytes Hyper may consume for one HTTP request head.
     max_request_head_bytes: usize,
+    /// Maximum number of fields allowed in one HTTP request head.
     max_header_fields: usize,
+    /// Maximum time allowed to finish reading request headers.
     header_read_timeout: Duration,
+    /// Maximum time a connection may go without successful socket I/O.
     inactivity_timeout: Duration,
 }
 
 impl Default for TransportLimits {
+    /// Returns the resource budget used by the production listener.
     fn default() -> Self {
         Self {
             max_connections: 64,
@@ -41,10 +54,16 @@ impl Default for TransportLimits {
     }
 }
 
+/// Serves the router indefinitely using the production transport limits.
 pub(crate) async fn serve(listener: TcpListener, router: Router) -> io::Result<()> {
     serve_with_limits(listener, router, TransportLimits::default()).await
 }
 
+/// Runs the permit-before-accept loop with explicit limits.
+///
+/// Accepting only after a permit is available keeps excess connections in the
+/// operating system's bounded listen queue rather than creating unbounded
+/// application tasks.
 async fn serve_with_limits(
     listener: TcpListener,
     router: Router,
@@ -65,13 +84,21 @@ async fn serve_with_limits(
     }
 }
 
+/// Adapts one accepted Tokio stream to Hyper and spawns its connection task.
+///
+/// `permit` moves into the task so the connection slot remains occupied for the
+/// complete Hyper connection, including keep-alive time and response streaming.
 fn spawn_connection(
     stream: TcpStream,
     router: Router,
     limits: TransportLimits,
     permit: OwnedSemaphorePermit,
 ) {
+    // Hyper supplies `Incoming` request bodies. Axum expects its own `Body`
+    // wrapper, so map only the body while preserving method, URI, and headers.
     let tower_service = router.map_request(|request: Request<Incoming>| request.map(Body::new));
+    // Axum routers implement Tower's Service trait; this adapter presents that
+    // service using the interface Hyper's connection driver expects.
     let hyper_service = TowerToHyperService::new(tower_service);
 
     tokio::spawn(async move {
@@ -82,6 +109,8 @@ fn spawn_connection(
             .timer(TokioTimer::new());
 
         let stream = InactivityTimeout::new(stream, limits.inactivity_timeout);
+        // A malformed request, timeout, or peer disconnect ends only this
+        // connection. Structured transport diagnostics are a later milestone.
         let _ = http
             .serve_connection(TokioIo::new(stream), hyper_service)
             .await;
@@ -90,13 +119,22 @@ fn spawn_connection(
     });
 }
 
+/// Socket wrapper that fails reads or writes after a period without I/O
+/// progress.
+///
+/// This is an inactivity deadline, not a maximum connection duration. Every
+/// successful read or write of at least one byte moves the deadline forward.
 struct InactivityTimeout<T> {
+    /// Wrapped TCP stream or test I/O object.
     inner: T,
+    /// Inactivity interval applied after each successful I/O operation.
     timeout: Duration,
+    /// Reusable Tokio timer whose deadline is reset when activity occurs.
     deadline: Pin<Box<Sleep>>,
 }
 
 impl<T> InactivityTimeout<T> {
+    /// Wraps an I/O object and starts its first inactivity deadline immediately.
     fn new(inner: T, timeout: Duration) -> Self {
         Self {
             inner,
@@ -105,12 +143,14 @@ impl<T> InactivityTimeout<T> {
         }
     }
 
+    /// Extends the deadline by one full inactivity interval from now.
     fn record_activity(&mut self) {
         self.deadline
             .as_mut()
             .reset(time::Instant::now() + self.timeout);
     }
 
+    /// Polls the timer and translates expiry into an I/O timeout error.
     fn poll_timeout(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.deadline.as_mut().poll(context) {
             Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
@@ -123,6 +163,8 @@ impl<T> InactivityTimeout<T> {
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for InactivityTimeout<T> {
+    /// Rejects already-expired reads and resets the deadline only when the inner
+    /// reader actually produces bytes.
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -146,6 +188,8 @@ impl<T: AsyncRead + Unpin> AsyncRead for InactivityTimeout<T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for InactivityTimeout<T> {
+    /// Rejects already-expired writes and resets the deadline only when the
+    /// inner writer accepts at least one byte.
     fn poll_write(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -170,6 +214,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for InactivityTimeout<T> {
         }
     }
 
+    /// Applies the inactivity deadline while buffered output is being flushed.
+    ///
+    /// A successful flush does not reset the timer because it does not report
+    /// that any new bytes moved.
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
         if let Poll::Ready(result) = this.poll_timeout(context) {
@@ -185,6 +233,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for InactivityTimeout<T> {
         }
     }
 
+    /// Delegates shutdown directly so resource cleanup is not prevented by an
+    /// expired inactivity deadline.
     fn poll_shutdown(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
